@@ -12,26 +12,11 @@ import "./interfaces/IGateway.sol";
 import "../libraries/CanReclaimTokens.sol";
 
 contract LockGatewayStateV1 {
-    uint256 constant BIPS_DENOMINATOR = 10000;
-    uint256 public minimumBurnAmount;
-
     /// @notice Each Gateway is tied to a specific RenERC20 token.
     RenERC20LogicV1 public token;
 
     /// @notice The mintAuthority is an address that can sign mint requests.
     address public mintAuthority;
-
-    /// @dev feeRecipient is assumed to be an address (or a contract) that can
-    /// accept erc20 payments it cannot be 0x0.
-    /// @notice When tokens are mint or burnt, a portion of the tokens are
-    /// forwarded to a fee recipient.
-    address public feeRecipient;
-
-    /// @notice The mint fee in bips.
-    uint16 public lockFee;
-
-    /// @notice The burn fee in bips.
-    uint16 public releaseFee;
 
     /// @notice Each signature can only be seen once.
     mapping(bytes32 => bool) public status;
@@ -39,6 +24,8 @@ contract LockGatewayStateV1 {
     // LogMint and LogBurn contain a unique `n` that identifies
     // the mint or burn event.
     uint256 public nextN = 0;
+
+    bytes32 public selectorHash;
 }
 
 /// @notice Gateway handles verifying mint and burn requests. A mintAuthority
@@ -56,10 +43,11 @@ contract LockGatewayLogicV1 is
     event LogMintAuthorityUpdated(address indexed _newMintAuthority);
     event LogLock(
         bytes _to,
-        bytes _p,
         uint256 _amount,
         uint256 indexed _n,
-        bytes indexed _indexedTo
+        bytes indexed _indexedTo,
+        string _chain,
+        bytes _payload
     );
     event LogRelease(
         address indexed _to,
@@ -78,29 +66,25 @@ contract LockGatewayLogicV1 is
     }
 
     /// @param _token The RenERC20 this Gateway is responsible for.
-    /// @param _feeRecipient The recipient of burning and minting fees.
     /// @param _mintAuthority The address of the key that can sign mint
     ///        requests.
-    /// @param _lockFee The amount subtracted each mint request and
-    ///        forwarded to the feeRecipient. In BIPS.
-    /// @param _releaseFee The amount subtracted each burn request and
-    ///        forwarded to the feeRecipient. In BIPS.
     function initialize(
         RenERC20LogicV1 _token,
-        address _feeRecipient,
         address _mintAuthority,
-        uint16 _lockFee,
-        uint16 _releaseFee,
-        uint256 _minimumBurnAmount
+        bytes32 _selectorHash
     ) public initializer {
         Claimable.initialize(msg.sender);
         CanReclaimTokens.initialize(msg.sender);
-        minimumBurnAmount = _minimumBurnAmount;
         token = _token;
-        lockFee = _lockFee;
-        releaseFee = _releaseFee;
+        selectorHash = _selectorHash;
         updateMintAuthority(_mintAuthority);
-        updateFeeRecipient(_feeRecipient);
+    }
+
+    /// @param _selectorHash Hash of the token and chain selector.
+    ///        The hash should calculated from
+    ///        `SHA256(4 bytes of selector length, selector)`
+    function updateSelectorHash(bytes32 _selectorHash) public onlyOwner {
+        selectorHash = _selectorHash;
     }
 
     // Public functions ////////////////////////////////////////////////////////
@@ -129,33 +113,6 @@ contract LockGatewayLogicV1 is
         emit LogMintAuthorityUpdated(mintAuthority);
     }
 
-    /// @notice Allow the owner to update the fee recipient.
-    ///
-    /// @param _nextFeeRecipient The address to start paying fees to.
-    function updateFeeRecipient(address _nextFeeRecipient) public onlyOwner {
-        // 'mint' and 'burn' will fail if the feeRecipient is 0x0
-        require(
-            _nextFeeRecipient != address(0x0),
-            "Gateway: fee recipient cannot be 0x0"
-        );
-
-        feeRecipient = _nextFeeRecipient;
-    }
-
-    /// @notice Allow the owner to update the 'mint' fee.
-    ///
-    /// @param _nextLockFee The new fee for locking.
-    function updateLockFee(uint16 _nextLockFee) public onlyOwner {
-        lockFee = _nextLockFee;
-    }
-
-    /// @notice Allow the owner to update the burn fee.
-    ///
-    /// @param _nextReleaseFee The new fee for releasing.
-    function updateReleaseFee(uint16 _nextReleaseFee) public onlyOwner {
-        releaseFee = _nextReleaseFee;
-    }
-
     function lock(
         string memory _chain,
         bytes memory _to,
@@ -163,12 +120,9 @@ contract LockGatewayLogicV1 is
         uint256 _amount
     ) public returns (uint256) {
         require(token.transferFrom(msg.sender, address(this), _amount));
-        uint256 fee = _amount.mul(lockFee).div(BIPS_DENOMINATOR);
-        token.transfer(feeRecipient, fee);
-        uint256 amountAfterFee = _amount.sub(fee);
-        emit LogLock(_to, _payload, amountAfterFee, nextN, _to);
+        emit LogLock(_to, _amount, nextN, _to, _chain, _payload);
         nextN += 1;
-        return amountAfterFee;
+        return _amount;
     }
 
     /// @notice release verifies a release approval signature from RenVM and
@@ -217,18 +171,13 @@ contract LockGatewayLogicV1 is
         }
         status[signedMessageHash] = true;
 
-        uint256 fee = _amount.mul(releaseFee).div(BIPS_DENOMINATOR);
-        uint256 amountAfterFee = _amount.sub(fee);
-
         // Mint amount minus the fee
-        token.transfer(msg.sender, fee);
-        // Mint the fee
-        token.transfer(feeRecipient, amountAfterFee);
+        token.transfer(msg.sender, _amount);
 
-        emit LogRelease(msg.sender, amountAfterFee, nextN, signedMessageHash);
+        emit LogRelease(msg.sender, _amount, nextN, signedMessageHash);
         nextN += 1;
 
-        return amountAfterFee;
+        return _amount;
     }
 
     /// @notice verifySignature checks the the provided signature matches the provided
@@ -249,7 +198,7 @@ contract LockGatewayLogicV1 is
         bytes32 _nHash
     ) public view returns (bytes32) {
         return
-            keccak256(abi.encode(_pHash, _amount, address(token), _to, _nHash));
+            keccak256(abi.encode(_pHash, _amount, selectorHash, _to, _nHash));
     }
 }
 
