@@ -9,6 +9,6 @@ import "../Governance/Claimable.sol";
 /// that tracks the number of the underlying asset's unit represented by a
 /// single ERC20 token.
 contract ERC20WithRateV2 is Initializable, Ownable, ERC20 {
-    uint256 public constant _rateScale = 1e18;
-    uint256 internal _rate;
+    uint256 constant __gap1 = 0;
+    uint256 internal __gap2;
 }
